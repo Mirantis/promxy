@@ -1,16 +1,16 @@
 name: mirantis-publish
 
-# Builds and pushes the downstream Mirantis promxy image when a `-mirantis` tag
-# is pushed (e.g. v0.0.96-mirantis.1). Upstream release tags (v0.0.96, ...) do
-# NOT match this filter, so they are never republished to the Mirantis registry.
+# Builds and pushes the downstream Mirantis promxy image to GHCR when a
+# `-mirantis` tag is pushed (e.g. v0.0.96-mirantis.1). Upstream release tags
+# (v0.0.96, ...) do NOT match this filter, so they are never republished.
 #
-# Required repository configuration on mirantis/promxy (set by OSPO/IT):
-#   Variables:
-#     REGISTRY     registry host, e.g. quay.io   (used for docker login)
-#     IMAGE_NAME   namespace/repo, e.g. mirantis/promxy
-#   Secrets:
-#     REGISTRY_USERNAME
-#     REGISTRY_PASSWORD
+# Auth uses the repo's built-in GITHUB_TOKEN: it can push packages under
+# ghcr.io/mirantis because this repo lives in that org, so no external registry
+# secret is required.
+#
+# NOTE: the package is created PRIVATE on first push. An org admin must set
+# ghcr.io/mirantis/promxy to public so kof can pull it without an image pull
+# secret.
 
 on:
   push:
@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   publish:
@@ -28,12 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to the Mirantis registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ vars.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -47,7 +48,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ vars.REGISTRY }}/${{ vars.IMAGE_NAME }}:${{ github.ref_name }}
+          tags: ghcr.io/mirantis/promxy:${{ github.ref_name }}
           # Reuse the Go build cache + image layers across runs (pairs with the
           # cache mounts in the Dockerfile) so the multi-arch build doesn't
           # recompile promxy + vendor from scratch every time.
