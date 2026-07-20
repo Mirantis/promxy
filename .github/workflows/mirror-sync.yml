@@ -1,0 +1,94 @@
+# .github/workflows/mirror-sync.yml
+# Mirror-sync for mirantis/promxy (temporary mirror of jacksontj/promxy).
+# Adapted from the OSPO "Mirror Git Sync" template:
+#   https://mirantis.jira.com/wiki/spaces/OSPO/pages/6508347422
+#
+# Adaptations vs. the template:
+#   - promxy's default branch is `master` (template assumed `main`)
+#   - upstream URL points at jacksontj/promxy
+#   - added `permissions: contents: write` so the default GITHUB_TOKEN can force-push
+#
+# Behaviour:
+#   - Syncs `master` daily with upstream (force sync, never fails on conflicts)
+#   - Preserves hotfix/* branches (only `master` is reset)
+#   - Manual trigger via workflow_dispatch
+
+name: Mirror Sync with Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:     # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout mirror repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history needed for mirror operations
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Add upstream remote
+      run: |
+        git remote add upstream https://github.com/jacksontj/promxy.git
+
+        if ! git fetch upstream; then
+          echo "::error::Failed to fetch from upstream repository"
+          exit 1
+        fi
+
+        echo "Successfully fetched from upstream"
+
+    - name: Force sync master branch with upstream
+      run: |
+        if ! git checkout master; then
+          echo "::error::Failed to checkout master branch"
+          exit 1
+        fi
+
+        # Reset master to exactly match upstream/master
+        if ! git reset --hard upstream/master; then
+          echo "::error::Failed to reset master branch to upstream/master"
+          exit 1
+        fi
+
+        if ! git push origin master --force-with-lease; then
+          echo "::error::Failed to push master branch to mirror"
+          exit 1
+        fi
+
+        echo "Successfully synced master branch with upstream"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Clean up stale upstream tracking branches
+      run: |
+        # Prunes stale remote-tracking refs only; does not delete real branches
+        git remote prune upstream
+        echo "Cleaned up stale upstream tracking branches"
+        echo "Note: Only master is synced - hotfix/* branches are preserved"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Report sync status
+      run: |
+        echo "Mirror sync completed successfully"
+        echo "master now matches upstream/master exactly"
+        echo ""
+        echo "Latest commits on master:"
+        git log --oneline -5
+        echo ""
+        echo "Hotfix branches (preserved):"
+        git branch | grep 'hotfix/' || echo "  No hotfix branches found"
+        echo ""
+        echo "Mirror repository is ready for development"
