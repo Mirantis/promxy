@@ -127,9 +127,15 @@ jobs:
         git fetch origin "${TARGET_BRANCH}" || true
         OLD_TIP="$(git rev-parse --verify -q "origin/${TARGET_BRANCH}" || true)"
 
+        # Skip only when the target already has exactly the shape we would push:
+        # same tree, built on the current upstream tip, and at most one commit
+        # (the overrides commit) on top. Same tree alone is not enough: a merged
+        # PR that edits a mirror workflow leaves extra commits that rebuild to
+        # the same tree, and those should be squashed back into one commit.
         if [ -n "${OLD_TIP}" ] \
            && git diff --quiet "${OLD_TIP}" HEAD \
-           && git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "${OLD_TIP}"; then
+           && git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "${OLD_TIP}" \
+           && [ "$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..${OLD_TIP}")" -le 1 ]; then
           echo "${TARGET_BRANCH} already matches upstream/${UPSTREAM_BRANCH} + overrides; nothing to push"
           exit 0
         fi
@@ -171,4 +177,9 @@ jobs:
         fi
         echo ""
         echo "Hotfix branches (preserved, never touched):"
-        git ls-remote --heads origin 'hotfix/*' | awk '{print "  " $2}' || echo "  No hotfix branches found"
+        HOTFIX_BRANCHES="$(git ls-remote --heads origin 'hotfix/*' | awk '{print "  " $2}')"
+        if [ -n "${HOTFIX_BRANCHES}" ]; then
+          echo "${HOTFIX_BRANCHES}"
+        else
+          echo "  No hotfix branches found"
+        fi
