@@ -1,4 +1,15 @@
 {{- if .Values.deployment.enabled }}
+{{- $shardCount := index (.Values.extraArgs | default dict) "rules.shard-count" | default 1 | int }}
+{{- if gt $shardCount 1 }}
+  {{- /*
+    Rule sharding assigns each rule group to exactly one shard index, so every
+    replica needs a stable, distinct index. A Deployment gives pods random name
+    suffixes, so promxy's 'auto' index detection cannot work here; the operator
+    must supply PROMXY_SHARD_INDEX per pod, which a Deployment cannot do. Use a
+    StatefulSet (whose pods are named promxy-0, promxy-1, ...) instead.
+  */}}
+  {{- fail "rules.shard-count > 1 is not supported by this Deployment template: rule sharding needs a stable per-pod shard index, which Deployment pod names do not provide. Deploy the rule-evaluating replicas as a StatefulSet (pods promxy-0..N-1, so --rules.shard-index=auto resolves) and keep this Deployment query-only with no rule_files." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
