@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine3.21 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.14-alpine3.23 AS builder
 
 ARG BUILDPLATFORM
 ARG TARGETARCH
@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
 RUN --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
     cd /go/src/github.com/jacksontj/promxy/cmd/remote_write_exporter && CGO_ENABLED=0 go build -mod=vendor
 
-FROM   alpine:3.21.3
+FROM   alpine:3.23.6
 LABEL  org.opencontainers.image.authors="Thomas Jackson <jacksontj.89@gmail.com>"
 EXPOSE 8082
 
