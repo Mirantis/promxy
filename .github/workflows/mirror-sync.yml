@@ -3,25 +3,67 @@
 # Adapted from the OSPO "Mirror Git Sync" template:
 #   https://mirantis.jira.com/wiki/spaces/OSPO/pages/6508347422
 #
-# Adaptations vs. the template:
-#   - promxy's default branch is `master` (template assumed `main`)
-#   - upstream URL points at jacksontj/promxy
-#   - added `permissions: contents: write` so the default GITHUB_TOKEN can force-push
+# Why this differs from the template
+# ----------------------------------
+# The template does `git reset --hard upstream/main && git push --force`. On
+# this mirror that push is rejected every time:
 #
-# Behaviour:
-#   - Syncs `master` daily with upstream (force sync, never fails on conflicts)
-#   - Preserves hotfix/* branches (only `master` is reset)
-#   - Manual trigger via workflow_dispatch
+#   ! [remote rejected] master -> master (refusing to allow a GitHub App to
+#     create or update workflow `.github/workflows/build.yml` without
+#     `workflows` permission)
+#
+# The default GITHUB_TOKEN can never create or modify files under
+# .github/workflows/, no matter what `permissions:` declares. The mirror's
+# master carries mirror-only workflow changes (this file, mirantis-publish.yml,
+# and a "skip on mirrors" guard in build.yml), so a plain reset to upstream
+# would rewrite them and the push is refused. Even with a privileged token the
+# template would delete this very file from master, and scheduled workflows
+# only run from the default branch, so the first successful sync would also be
+# the last one.
+#
+# What this workflow does instead
+# -------------------------------
+#   1. Reset to upstream/master (everything outside .github/workflows/ now
+#      matches upstream exactly).
+#   2. Restore .github/workflows/ byte-for-byte from the current mirror master
+#      and commit it as a single "mirror-only workflow overrides" commit.
+#      Because the workflow blobs are unchanged between the old and new tip of
+#      master, GITHUB_TOKEN is allowed to force-push the result.
+#   3. Force-push: master == upstream/master + exactly one commit.
+#
+# Consequences
+#   - hotfix/* and feature/* branches are never touched.
+#   - Upstream changes to files under .github/workflows/ are NOT picked up
+#     automatically (GITHUB_TOKEN cannot push them). The report step lists any
+#     such drift as a warning; port it by hand in a PR when needed.
+#   - `target_branch` exists so the sync logic can be dry-run against a scratch
+#     branch without touching master.
 
 name: Mirror Sync with Upstream
 
 on:
   schedule:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC
-  workflow_dispatch:     # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch on the mirror to overwrite (default: master). Use a scratch branch to test.'
+        required: false
+        default: 'master'
 
 permissions:
   contents: write
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jacksontj/promxy
+  UPSTREAM_BRANCH: master
+  # The branch whose .github/workflows/ is carried over on every sync.
+  MIRROR_BRANCH: master
+  TARGET_BRANCH: ${{ inputs.target_branch || 'master' }}
 
 jobs:
   sync:
@@ -30,6 +72,7 @@ jobs:
     - name: Checkout mirror repository
       uses: actions/checkout@v4
       with:
+        ref: ${{ env.MIRROR_BRANCH }}
         fetch-depth: 0  # Full history needed for mirror operations
         token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -38,57 +81,94 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Add upstream remote
+    - name: Fetch upstream
       run: |
-        git remote add upstream https://github.com/jacksontj/promxy.git
+        git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
 
-        if ! git fetch upstream; then
+        if ! git fetch upstream "${UPSTREAM_BRANCH}"; then
           echo "::error::Failed to fetch from upstream repository"
           exit 1
         fi
 
-        echo "Successfully fetched from upstream"
+        echo "Successfully fetched upstream/${UPSTREAM_BRANCH}"
 
-    - name: Force sync master branch with upstream
+    - name: Build synced tree (upstream + mirror-only workflow overrides)
+      id: build
       run: |
-        if ! git checkout master; then
-          echo "::error::Failed to checkout master branch"
-          exit 1
+        set -euo pipefail
+
+        # Start from upstream exactly.
+        git checkout --detach "upstream/${UPSTREAM_BRANCH}"
+
+        # Carry .github/workflows/ over from the mirror branch byte-for-byte.
+        # Any file upstream added there is dropped; any file the mirror has is
+        # restored. This is the only shape GITHUB_TOKEN is allowed to push.
+        git rm -r -q --cached --ignore-unmatch .github/workflows
+        rm -rf .github/workflows
+        git checkout "origin/${MIRROR_BRANCH}" -- .github/workflows
+        git add -A .github/workflows
+
+        if git diff --cached --quiet; then
+          echo "Mirror workflows are identical to upstream; no override commit needed"
+        else
+          git commit -q -m "ci: mirror-only workflow overrides (re-applied by mirror-sync)" \
+            -m "Automatically re-applied on top of upstream/${UPSTREAM_BRANCH} by .github/workflows/mirror-sync.yml." \
+            -m "Everything outside .github/workflows/ matches upstream exactly."
         fi
 
-        # Reset master to exactly match upstream/master
-        if ! git reset --hard upstream/master; then
-          echo "::error::Failed to reset master branch to upstream/master"
-          exit 1
-        fi
+        echo "Synced tree built at $(git rev-parse --short HEAD) on top of upstream $(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
 
-        if ! git push origin master --force-with-lease; then
-          echo "::error::Failed to push master branch to mirror"
-          exit 1
-        fi
-
-        echo "Successfully synced master branch with upstream"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Clean up stale upstream tracking branches
+    - name: Push to mirror
       run: |
-        # Prunes stale remote-tracking refs only; does not delete real branches
-        git remote prune upstream
-        echo "Cleaned up stale upstream tracking branches"
-        echo "Note: Only master is synced - hotfix/* branches are preserved"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        set -euo pipefail
+
+        # Only the sync branch is fetched by actions/checkout; make sure we have
+        # the current tip of the target so the lease is accurate.
+        git fetch origin "${TARGET_BRANCH}" || true
+        OLD_TIP="$(git rev-parse --verify -q "origin/${TARGET_BRANCH}" || true)"
+
+        if [ -n "${OLD_TIP}" ] \
+           && git diff --quiet "${OLD_TIP}" HEAD \
+           && git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "${OLD_TIP}"; then
+          echo "${TARGET_BRANCH} already matches upstream/${UPSTREAM_BRANCH} + overrides; nothing to push"
+          exit 0
+        fi
+
+        # --force-with-lease=<ref>:<sha> fails if someone moved the branch since
+        # we fetched; an empty <sha> means "expect the branch not to exist".
+        if ! git push origin "HEAD:refs/heads/${TARGET_BRANCH}" \
+             --force-with-lease="refs/heads/${TARGET_BRANCH}:${OLD_TIP}"; then
+          echo "::error::Failed to push ${TARGET_BRANCH} to mirror"
+          exit 1
+        fi
+
+        echo "Successfully synced ${TARGET_BRANCH} with upstream/${UPSTREAM_BRANCH}"
 
     - name: Report sync status
       run: |
-        echo "Mirror sync completed successfully"
-        echo "master now matches upstream/master exactly"
+        echo "=== Mirror Sync Report ==="
+        echo "target branch : ${TARGET_BRANCH}"
+        echo "upstream tip  : $(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+        echo "mirror tip    : $(git rev-parse --short HEAD)"
         echo ""
-        echo "Latest commits on master:"
+        echo "Latest commits:"
         git log --oneline -5
         echo ""
-        echo "Hotfix branches (preserved):"
-        git branch | grep 'hotfix/' || echo "  No hotfix branches found"
+
+        # Workflow files the mirror carries that differ from upstream. These are
+        # expected for the mirror-only files; anything else is upstream drift
+        # that has to be ported by hand (GITHUB_TOKEN cannot push it).
+        DRIFT="$(git diff --name-status "upstream/${UPSTREAM_BRANCH}" HEAD -- .github/workflows || true)"
+        if [ -n "${DRIFT}" ]; then
+          echo "Workflow files differing from upstream (not auto-synced):"
+          echo "${DRIFT}" | sed 's/^/  /'
+          echo "${DRIFT}" | while read -r status file; do
+            case "${file}" in
+              .github/workflows/mirror-sync.yml|.github/workflows/mirantis-publish.yml|.github/workflows/build.yml) ;;
+              *) echo "::warning file=${file}::Upstream changed this workflow file; port it manually (GITHUB_TOKEN cannot push workflow changes)";;
+            esac
+          done
+        fi
         echo ""
-        echo "Mirror repository is ready for development"
+        echo "Hotfix branches (preserved, never touched):"
+        git ls-remote --heads origin 'hotfix/*' | awk '{print "  " $2}' || echo "  No hotfix branches found"
