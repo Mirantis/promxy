@@ -109,8 +109,10 @@ To spread the work instead of duplicating it, use **rule sharding**:
 
 Each rule *group* is assigned to exactly one shard, so the replicas partition the rule set between them with no
 leader election, no coordination and no shared state: the assignment is a pure function of the group's identity and
-the shard count, which every replica computes independently. Assignment uses rendezvous hashing, so changing
-`--rules.shard-count` only reassigns roughly `1/max(old,new)` of the groups rather than nearly all of them.
+the shard count, which every replica computes independently. Assignment uses rendezvous hashing, so resizing from
+`old` to `new` shards only reassigns roughly `abs(old-new)/max(old,new)` of the groups rather than nearly all of
+them. Adding or removing a single shard therefore moves about `1/max(old,new)` of the groups; bigger jumps move
+proportionally more (3 -> 6 moves about half).
 
 Groups that belong to another shard are still loaded and visible in `/api/v1/rules`, they are simply not evaluated
 locally.
