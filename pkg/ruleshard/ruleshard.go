@@ -15,8 +15,11 @@
 // the shard count, so every replica independently computes the same answer.
 //
 // Assignment uses rendezvous (highest-random-weight) hashing rather than a
-// simple modulo so that changing the shard count only reassigns roughly
-// 1/max(old,new) of the groups instead of nearly all of them.
+// simple modulo so that changing the shard count from old to new only
+// reassigns roughly abs(old-new)/max(old,new) of the groups instead of nearly
+// all of them. Adding or removing a single shard therefore moves about
+// 1/max(old,new) of the groups, while larger resizes move proportionally more
+// (3 -> 6 shards moves about half of them).
 //
 // Note that a group is owned by exactly one shard: there is no replication. If
 // the owning replica is down, its groups are not evaluated until it comes back
@@ -123,7 +126,17 @@ func (s *Sharder) shardFor(file, group string) int {
 
 // groupKey is the stable identity of a rule group across replicas.
 func groupKey(file, group string) string {
-	return filepath.Base(file) + ";" + group
+	return FileIdentity(file) + ";" + group
+}
+
+// FileIdentity returns the portion of a rule file path that participates in
+// shard assignment.
+//
+// Callers that need to label a rule group in a way that is comparable across
+// replicas (metrics, logs) must use this rather than the raw path, since the
+// raw path can legitimately differ between replicas while the identity cannot.
+func FileIdentity(file string) string {
+	return filepath.Base(file)
 }
 
 // goldenGamma is the odd increment from SplitMix64, used to decorrelate the
@@ -169,7 +182,7 @@ func (s *Sharder) EvalIterationFunc(m *Metrics) rules.GroupEvalIterationFunc {
 func CheckFileCollisions(files []string) error {
 	seen := make(map[string]string, len(files))
 	for _, f := range files {
-		base := filepath.Base(f)
+		base := FileIdentity(f)
 		if prev, ok := seen[base]; ok && prev != f {
 			return fmt.Errorf("rule files %q and %q share the base name %q; rule sharding hashes base names, so these files are indistinguishable to the sharder", prev, f, base)
 		}

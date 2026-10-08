@@ -83,7 +83,7 @@ func TestEvalIterationFuncSkipsUnowned(t *testing.T) {
 	// Each group is unowned by exactly count-1 shards.
 	for _, g := range groups {
 		got := gaugeValue(t, m.skipped, map[string]string{
-			"rule_group_file": g.File(),
+			"rule_group_file": FileIdentity(g.File()),
 			"rule_group":      g.Name(),
 		})
 		if got != float64(count-1) {
@@ -111,7 +111,7 @@ func TestSyncGroups(t *testing.T) {
 		sum := 0.0
 		for _, g := range groups {
 			sum += gaugeValue(t, m.owned, map[string]string{
-				"rule_group_file": g.File(),
+				"rule_group_file": FileIdentity(g.File()),
 				"rule_group":      g.Name(),
 			})
 		}
@@ -142,6 +142,31 @@ func TestSyncGroupsResets(t *testing.T) {
 	close(ch)
 	if n := len(ch); n != 1 {
 		t.Errorf("got %d ownership series after removing a group, want 1", n)
+	}
+}
+
+// TestMetricLabelsArePathIndependent pins the invariant that the exported
+// labels use the same identity the sharder hashes. Replicas may mount the same
+// rule files at different paths; if the labels carried the raw path, summing
+// promxy_rule_group_shard_owned across replicas would not yield 1 per group.
+func TestMetricLabelsArePathIndependent(t *testing.T) {
+	s := mustNew(t, 0, 3)
+
+	a := NewMetrics(prometheus.NewRegistry())
+	b := NewMetrics(prometheus.NewRegistry())
+
+	a.SyncGroups(s, []*rules.Group{newTestGroup(t, "/etc/promxy/rules/a.yaml", "g1")})
+	b.SyncGroups(s, []*rules.Group{newTestGroup(t, "/var/run/configmap/..data/a.yaml", "g1")})
+
+	want := map[string]string{"rule_group_file": "a.yaml", "rule_group": "g1"}
+	if av, bv := gaugeValue(t, a.owned, want), gaugeValue(t, b.owned, want); av != bv {
+		t.Errorf("same group at different paths produced %v and %v", av, bv)
+	}
+
+	a.ObserveSkipped("/etc/promxy/rules/a.yaml", "g1")
+	b.ObserveSkipped("/var/run/configmap/..data/a.yaml", "g1")
+	if av, bv := gaugeValue(t, a.skipped, want), gaugeValue(t, b.skipped, want); av != 1 || bv != 1 {
+		t.Errorf("skip counters diverged by path: %v and %v", av, bv)
 	}
 }
 
