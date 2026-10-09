@@ -131,6 +131,13 @@ type ServerGroupState struct {
 	// metadata cache, which fetches from one target per HA key).
 	multiAPI *promclient.MultiAPI
 
+	// probeTargets pairs each discovered target with its own API client, for
+	// the health probe. These are captured before the group-level IgnoreError
+	// and DowngradeError wrappers are applied: those wrappers deliberately
+	// hide a backend's failures from user queries, which is exactly what the
+	// probe must still be able to see.
+	probeTargets []probeTarget
+
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 }
@@ -161,6 +168,10 @@ type ServerGroup struct {
 	// is > 0; when zero, the cache stays empty and IsHistogramMetric always
 	// returns false (AST-only routing). See pkg/servergroup/histogram_cache.go.
 	histogramCache histogramMetadataCache
+
+	// healthProber runs the active liveness probe for this group when
+	// health_probe is enabled. See pkg/servergroup/health.go.
+	healthProber healthProber
 }
 
 // IsHistogramMetric reports whether the given metric name is known to be a
@@ -297,6 +308,7 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 
 	targets := make([]string, 0)
 	apiClients := make([]promclient.API, 0)
+	probeTargets := make([]probeTarget, 0)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	oldState := s.State()
@@ -450,7 +462,11 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 				}
 
 				// Add wrap for the specific target, and add to the list
-				apiClients = append(apiClients, &promclient.ErrorWrap{apiClient, "error in target=" + u.String()})
+				wrapped := &promclient.ErrorWrap{apiClient, "error in target=" + u.String()}
+				apiClients = append(apiClients, wrapped)
+				// Capture the same per-target client for the health probe,
+				// before the group-level error-suppressing wrappers below.
+				probeTargets = append(probeTargets, probeTarget{Host: u.Host, API: wrapped})
 			}
 		}
 	}
@@ -468,10 +484,11 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 	newState := &ServerGroupState{
 		Targets: targets,
 		// Add error wrap for this specific servergroup
-		apiClient: &promclient.ErrorWrap{apiClient, fmt.Sprintf("error in servergroup ord=%d", cfg.Ordinal)},
-		multiAPI:  apiClient,
-		ctx:       ctx,
-		ctxCancel: ctxCancel,
+		apiClient:    &promclient.ErrorWrap{apiClient, fmt.Sprintf("error in servergroup ord=%d", cfg.Ordinal)},
+		multiAPI:     apiClient,
+		probeTargets: probeTargets,
+		ctx:          ctx,
+		ctxCancel:    ctxCancel,
 	}
 
 	if cfg.IgnoreError {
@@ -614,6 +631,20 @@ func (s *ServerGroup) ApplyConfig(cfg *Config) error {
 		cfg.NativeHistogram.MetadataRefresh,
 		logrus.WithFields(logrus.Fields{
 			"component": "histogram-metadata-cache",
+			"sg":        cfg.Ordinal,
+		}),
+	)
+
+	// Start the health probe if configured. Like the metadata cache, start is
+	// idempotent across ApplyConfig cycles; the loop re-reads the config on
+	// every tick, so a reload that only changes probe timings or alert labels
+	// is picked up without a restart.
+	s.healthProber.start(
+		s.ctx,
+		s.State,
+		s.Config,
+		logrus.WithFields(logrus.Fields{
+			"component": "servergroup-health-probe",
 			"sg":        cfg.Ordinal,
 		}),
 	)
