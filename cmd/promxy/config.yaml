@@ -301,6 +301,66 @@ promxy:
       # query can still succeed
       ignore_error: true
 
+      # health_probe runs an active liveness probe against this server group's
+      # targets. It is off by default.
+      #
+      # Its purpose is to close a blind spot created by ignore_error above.
+      # With errors suppressed, a server group that is unreachable returns an
+      # empty result rather than failing -- which is indistinguishable from a
+      # server group that simply has no data. Every alerting rule evaluated
+      # over that backend's metrics then goes from firing to inactive when the
+      # backend disappears, so an outage reads as a recovery.
+      #
+      # When enabled, promxy sends a cheap instant query to each target on an
+      # interval and exposes the result as metrics on its own /metrics:
+      #   server_group_up{ordinal,name}                        1 / 0
+      #   server_group_target_up{ordinal,name,target}          1 / 0
+      #   server_group_targets_up{ordinal,name}                count
+      #   server_group_health_probe_duration_seconds{...}      histogram
+      #   server_group_health_probes_total{...,result}         counter
+      #   server_group_last_successful_probe_timestamp_seconds{ordinal,name}
+      #
+      # It also pushes an alert straight to the configured alertmanagers (see
+      # `alerting` above). That push deliberately bypasses rule evaluation:
+      # rules are evaluated against the federated view of the server groups, so
+      # a rule alerting on an unreachable group would have to read its evidence
+      # through the very group that is unreachable. Scraping promxy's metrics
+      # into storage and alerting on `server_group_up == 0` works only if that
+      # storage is not itself behind the failed server group.
+      #
+      # health_probe:
+      #   enabled: true
+      #   # How often each target is probed.
+      #   interval: 15s
+      #   # Bounds a single probe; must be less than interval.
+      #   timeout: 5s
+      #   # How long the whole group must be continuously down before alerting,
+      #   # mirroring an alerting rule's `for:`. Omit for the 1m default; set
+      #   # explicitly to 0 to alert on the first failed probe.
+      #   for: 1m
+      #   # The instant query used as the probe. The default exercises DNS,
+      #   # TCP, TLS, auth, routing and the downstream query engine without
+      #   # touching any series.
+      #   query: "1"
+      #   # Set false to export the metrics but never push to alertmanager.
+      #   send_alerts: true
+      #   # Value of the `alertname` label.
+      #   alert_name: PromxyServerGroupDown
+      #   # Extra labels on the raised alert. The probe's own identity labels
+      #   # (alertname, server_group, server_group_ordinal) cannot be
+      #   # overridden from here, and the server group's `labels` above are
+      #   # attached as well.
+      #   alert_labels:
+      #     severity: critical
+      #   # Extra annotations on the raised alert, e.g. runbook or dashboard
+      #   # links. The probe's own `summary` and `description` cannot be
+      #   # overridden from here. These are emitted verbatim -- the alert is
+      #   # pushed straight to alertmanager rather than evaluated by the rule
+      #   # manager, so there is no templating pass and `{{ $labels.foo }}`
+      #   # would arrive unexpanded. Use literal values.
+      #   alert_annotations:
+      #     runbook: https://example.com/runbooks/server-group-down
+
   # alert_templates optionally customizes the GeneratorURL promxy sets on the
   # alerts it sends to Alertmanager. By default promxy emits the same
   # Prometheus-style URL as upstream (a link to promxy's own graph page for the
