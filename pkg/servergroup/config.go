@@ -366,6 +366,16 @@ type HealthProbeConfig struct {
 	// `severity: critical` or a routing key. The probe's own labels
 	// (alertname, server_group, server_group_ordinal) take precedence.
 	AlertLabels map[string]string `yaml:"alert_labels,omitempty"`
+
+	// AlertAnnotations are extra annotations attached to the raised alert,
+	// e.g. a runbook or dashboard link. The probe's own `summary` and
+	// `description` take precedence, since they carry the diagnostic detail.
+	//
+	// Note that these are emitted verbatim: this alert is pushed straight to
+	// Alertmanager rather than evaluated by the rule manager, so there is no
+	// rule-templating pass and `{{ $labels.foo }}` references would arrive
+	// unexpanded. Use literal values.
+	AlertAnnotations map[string]string `yaml:"alert_annotations,omitempty"`
 }
 
 // applyDefaults fills in the zero-valued fields. Called from UnmarshalYAML so

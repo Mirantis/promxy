@@ -423,13 +423,21 @@ func (h *healthProber) buildAlert(cfg *Config, total, upCount int, failures []st
 		reason = fmt.Sprintf("%v", failures)
 	}
 
-	annotations := model.LabelSet{
-		"summary": model.LabelValue(fmt.Sprintf("promxy server group %q is unreachable", identityForAlert(cfg))),
-		"description": model.LabelValue(fmt.Sprintf(
-			"promxy could not reach any target in server group %s (%d/%d targets up). Queries against this backend are returning empty results, so alerts derived from its data will appear to resolve rather than fire. Last error: %s",
-			identityForAlert(cfg), upCount, total, reason,
-		)),
+	annotations := model.LabelSet{}
+
+	// Operator-supplied annotations first, so the probe's own summary and
+	// description -- which carry the diagnostic detail -- cannot be replaced.
+	for k, v := range cfg.HealthProbe.AlertAnnotations {
+		if ln := model.LabelName(k); ln.IsValid() {
+			annotations[ln] = model.LabelValue(v)
+		}
 	}
+
+	annotations["summary"] = model.LabelValue(fmt.Sprintf("promxy server group %q is unreachable", identityForAlert(cfg)))
+	annotations["description"] = model.LabelValue(fmt.Sprintf(
+		"promxy could not reach any target in server group %s (%d/%d targets up). Queries against this backend are returning empty results, so alerts derived from its data will appear to resolve rather than fire. Last error: %s",
+		identityForAlert(cfg), upCount, total, reason,
+	))
 
 	return HealthAlert{Labels: lbls, Annotations: annotations}
 }
