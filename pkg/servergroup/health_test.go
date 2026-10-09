@@ -658,6 +658,40 @@ func TestHealthProbeAlertLabelsCannotMaskIdentity(t *testing.T) {
 	}
 }
 
+// TestHealthProbeAlertAnnotations covers the annotation passthrough used for
+// runbook and dashboard links, and ensures the probe's own diagnostic
+// annotations cannot be displaced by them.
+func TestHealthProbeAlertAnnotations(t *testing.T) {
+	cfg := &Config{Ordinal: 25, Name: "annotated"}
+	cfg.HealthProbe = HealthProbeConfig{
+		Enabled: true,
+		AlertAnnotations: map[string]string{
+			"Dashboard": "https://grafana.example.com/d/o11y-victoria-metrics-cluster?var-cluster=annotated",
+			"runbook":   "https://docs.example.com/region-down",
+			// Must not win over the probe's own diagnostic text.
+			"description": "overwritten",
+			"summary":     "overwritten",
+		},
+	}
+	cfg.HealthProbe.applyDefaults()
+
+	h := &healthProber{}
+	a := h.buildAlert(cfg, 1, 0, []string{"x:443: boom"})
+
+	if got, want := a.Annotations["Dashboard"], model.LabelValue("https://grafana.example.com/d/o11y-victoria-metrics-cluster?var-cluster=annotated"); got != want {
+		t.Errorf("Dashboard = %q, want %q", got, want)
+	}
+	if got, want := a.Annotations["runbook"], model.LabelValue("https://docs.example.com/region-down"); got != want {
+		t.Errorf("runbook = %q, want %q", got, want)
+	}
+	if got := string(a.Annotations["description"]); !strings.Contains(got, "could not reach any target") {
+		t.Errorf("description must keep the probe's diagnostic text, got %q", got)
+	}
+	if got := string(a.Annotations["summary"]); !strings.Contains(got, "is unreachable") {
+		t.Errorf("summary must keep the probe's text, got %q", got)
+	}
+}
+
 // TestSetHealthAlertSinkNilDetaches ensures detaching the sink is safe and
 // stops delivery (a reload must not panic mid-probe).
 func TestSetHealthAlertSinkNilDetaches(t *testing.T) {

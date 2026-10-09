@@ -352,6 +352,14 @@ promxy:
       #   # attached as well.
       #   alert_labels:
       #     severity: critical
+      #   # Extra annotations on the raised alert, e.g. runbook or dashboard
+      #   # links. The probe's own `summary` and `description` cannot be
+      #   # overridden from here. These are emitted verbatim -- the alert is
+      #   # pushed straight to alertmanager rather than evaluated by the rule
+      #   # manager, so there is no templating pass and `{{ $labels.foo }}`
+      #   # would arrive unexpanded. Use literal values.
+      #   alert_annotations:
+      #     runbook: https://example.com/runbooks/server-group-down
 
   # alert_templates optionally customizes the GeneratorURL promxy sets on the
   # alerts it sends to Alertmanager. By default promxy emits the same
