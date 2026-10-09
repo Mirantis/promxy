@@ -31,6 +31,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
 	_ "github.com/prometheus/prometheus/discovery/install" // Register service discovery implementations.
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
@@ -53,6 +54,7 @@ import (
 	"github.com/jacksontj/promxy/pkg/middleware"
 	"github.com/jacksontj/promxy/pkg/proxystorage"
 	"github.com/jacksontj/promxy/pkg/server"
+	"github.com/jacksontj/promxy/pkg/servergroup"
 )
 
 // maxNotificationSubscribers bounds the number of concurrent live subscribers
@@ -334,6 +336,29 @@ func main() {
 		logrus.Infof("Notifier manager stopped")
 	}()
 
+	// Route server group health probe alerts straight into the notifier.
+	//
+	// These deliberately bypass the rule manager. A rule is evaluated against
+	// the federated view of the server groups, so an alert reporting that a
+	// server group is unreachable would have to read its own evidence through
+	// the backend that just became unreachable -- and with `ignore_error: true`
+	// that read returns empty rather than failing, so the alert would never
+	// fire. Pushing from the probe loop keeps the alert independent of the
+	// failure it describes.
+	servergroup.SetHealthAlertSink(func(alerts ...servergroup.HealthAlert) {
+		res := make([]*notifier.Alert, 0, len(alerts))
+		for _, a := range alerts {
+			res = append(res, &notifier.Alert{
+				Labels:       labelSetToLabels(a.Labels),
+				Annotations:  labelSetToLabels(a.Annotations),
+				StartsAt:     a.StartsAt,
+				EndsAt:       a.EndsAt,
+				GeneratorURL: externalUrl.String(),
+			})
+		}
+		notifierManager.Send(res...)
+	})
+
 	var ruleQueryable storage.Queryable
 	// If alertbackfill is enabled; wire it up!
 	if opts.AlertBackfill {
@@ -598,6 +623,17 @@ func main() {
 
 		}
 	}
+}
+
+// labelSetToLabels converts a model.LabelSet into the labels.Labels form the
+// notifier expects. Output is sorted, as labels.Labels requires.
+func labelSetToLabels(ls model.LabelSet) labels.Labels {
+	b := labels.NewScratchBuilder(len(ls))
+	for k, v := range ls {
+		b.Add(string(k), string(v))
+	}
+	b.Sort()
+	return b.Labels()
 }
 
 // sendAlerts implements the rules.NotifyFunc for a Notifier.
