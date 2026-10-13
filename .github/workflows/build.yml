@@ -9,6 +9,11 @@ on:
 
 jobs:
   build:
+    # Publishes images to quay.io/jacksontj/promxy using secrets that exist only
+    # in the upstream repository. Skip on mirrors/forks (e.g. mirantis/promxy):
+    # they don't hold those secrets and must not push to the upstream registry.
+    # Downstream (mirantis) images are built and published separately.
+    if: github.repository == 'jacksontj/promxy'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
