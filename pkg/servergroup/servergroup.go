@@ -132,10 +132,11 @@ type ServerGroupState struct {
 	multiAPI *promclient.MultiAPI
 
 	// probeTargets pairs each discovered target with its own API client, for
-	// the health probe. These are captured before the group-level IgnoreError
-	// and DowngradeError wrappers are applied: those wrappers deliberately
-	// hide a backend's failures from user queries, which is exactly what the
-	// probe must still be able to see.
+	// the health probe. These are built from the bare per-target client:
+	// neither the group-level IgnoreError/DowngradeError wrappers (which
+	// deliberately hide a backend's failures from user queries) nor the
+	// per-target time-range and label filters (which can answer a probe
+	// without ever contacting the backend) are applied.
 	probeTargets []probeTarget
 
 	ctx       context.Context
@@ -393,6 +394,19 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					apiClient = &promclient.PromAPIRemoteRead{apiClient, remoteStorageClient}
 				}
 
+				// Snapshot the client for the health probe here, with the
+				// transport, authentication and query params already applied
+				// but before the layers below. Those layers exist to shape
+				// user query results and every one of them can make a probe
+				// succeed against a backend that is down: a time filter such
+				// as `relative_time_range.end: -1h` or a fail-closed
+				// label_filter turns the probe into an empty, error-free
+				// result that never reaches the backend at all. Matcher
+				// injection is re-applied to this client below, since it is
+				// part of how the target is addressed rather than a filter on
+				// the answer.
+				probeAPIClient := apiClient
+
 				// Optionally add time range layers
 				if cfg.AbsoluteTimeRangeConfig != nil {
 					apiClient = &promclient.AbsoluteTimeFilter{
@@ -438,6 +452,10 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					if err != nil {
 						return err
 					}
+					probeAPIClient, err = promclient.NewInjectMatchersClient(probeAPIClient, injectMatchers)
+					if err != nil {
+						return err
+					}
 				}
 
 				// Add labels
@@ -464,9 +482,14 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 				// Add wrap for the specific target, and add to the list
 				wrapped := &promclient.ErrorWrap{apiClient, "error in target=" + u.String()}
 				apiClients = append(apiClients, wrapped)
-				// Capture the same per-target client for the health probe,
-				// before the group-level error-suppressing wrappers below.
-				probeTargets = append(probeTargets, probeTarget{Host: u.Host, API: wrapped})
+				// The probe gets its own client: it must see the raw
+				// reachability of the target, not the filtered view the user
+				// queries get, and not the group-level error-suppressing
+				// wrappers applied below.
+				probeTargets = append(probeTargets, probeTarget{
+					Host: u.Host,
+					API:  &promclient.ErrorWrap{probeAPIClient, "error in health probe target=" + u.String()},
+				})
 			}
 		}
 	}

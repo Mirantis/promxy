@@ -328,6 +328,13 @@ promxy:
       # into storage and alerting on `server_group_up == 0` works only if that
       # storage is not itself behind the failed server group.
       #
+      # The probe uses its own client: it keeps this server group's scheme,
+      # http_client, http_headers, query_params and inject_matchers, but
+      # deliberately skips ignore_error/downgrade_error, the time range
+      # filters (absolute_time_range, relative_time_range) and label_filter.
+      # Those shape user query results and would otherwise let the probe be
+      # answered locally, reporting a dead backend as healthy.
+      #
       # health_probe:
       #   enabled: true
       #   # How often each target is probed.

@@ -97,9 +97,12 @@ type HealthAlert struct {
 	Labels      model.LabelSet
 	Annotations model.LabelSet
 	StartsAt    time.Time
-	// EndsAt is zero while the alert is firing, and set to the resolution time
-	// when the group recovers (an explicit resolve, rather than waiting for
-	// Alertmanager's resolve_timeout to expire it).
+	// EndsAt is always set. While the alert is firing it is an expiry in the
+	// future that comfortably covers the next probe round and re-send, so a
+	// continuous outage cannot be expired by Alertmanager's resolve_timeout
+	// (5m by default) just because the configured probe interval is longer
+	// than that. On recovery it is set to the resolution time, which resolves
+	// the alert explicitly rather than waiting for the expiry to lapse.
 	EndsAt time.Time
 }
 
@@ -150,6 +153,38 @@ type queryAPI interface {
 	Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet
 }
 
+// healthIdentity is the identity of the server group a prober speaks for. It
+// is exactly the label set of the group-level health metrics, so two probers
+// sharing an identity publish the same series and raise the same alert: on a
+// configuration reload they must hand state over rather than compete.
+type healthIdentity struct {
+	ordinal int
+	name    string
+}
+
+func identityForConfig(cfg *Config) healthIdentity {
+	return healthIdentity{ordinal: cfg.Ordinal, name: cfg.Name}
+}
+
+func (id healthIdentity) ordinalString() string {
+	return strconv.Itoa(id.ordinal)
+}
+
+// healthRegistry records which prober currently owns the published metrics and
+// the alert state machine for each server group identity.
+//
+// ProxyStorage.ApplyConfig builds a complete new set of ServerGroups and only
+// then cancels the old ones, so the replacement claims an identity before its
+// predecessor shuts down. That ordering is what makes ownership work: the
+// outgoing prober sees it is no longer the owner and neither deletes the
+// replacement's series nor publishes over them, while the replacement inherits
+// the outage state so an unchanged group keeps counting towards `for:` across
+// reloads instead of restarting its state machine.
+var healthRegistry = struct {
+	mtx    sync.Mutex
+	owners map[healthIdentity]*healthProber
+}{owners: make(map[healthIdentity]*healthProber)}
+
 // healthProber runs the periodic liveness probe for one server group and owns
 // the alert state machine derived from it.
 //
@@ -157,6 +192,12 @@ type queryAPI interface {
 // the probe carries no extra behaviour.
 type healthProber struct {
 	startOnce sync.Once
+
+	// identity is set once, when the prober claims ownership in start, and
+	// read without the lock afterwards. claimed distinguishes "owns the zero
+	// identity" from "never claimed one".
+	identity healthIdentity
+	claimed  bool
 
 	// mtx guards the alert state machine below. Only the probe goroutine
 	// mutates it, but tests inspect it.
@@ -175,6 +216,93 @@ type healthProber struct {
 	knownTargets map[string]struct{}
 }
 
+// claim makes h the owner of id's metrics and alert state, adopting whatever
+// the previous owner had accumulated. Returns the predecessor, if any.
+func (h *healthProber) claim(id healthIdentity) *healthProber {
+	healthRegistry.mtx.Lock()
+	prev := healthRegistry.owners[id]
+	healthRegistry.owners[id] = h
+	healthRegistry.mtx.Unlock()
+
+	h.identity = id
+	h.claimed = true
+	if prev == nil || prev == h {
+		return nil
+	}
+
+	// Snapshot the predecessor and copy it over. The two probers are locked
+	// one at a time, never nested, so there is no ordering to get wrong.
+	prev.mtx.Lock()
+	downSince, firing, lastSent := prev.downSince, prev.firing, prev.lastSent
+	knownTargets := prev.knownTargets
+	prev.mtx.Unlock()
+
+	h.mtx.Lock()
+	h.downSince, h.firing, h.lastSent = downSince, firing, lastSent
+	h.knownTargets = knownTargets
+	h.mtx.Unlock()
+
+	return prev
+}
+
+// isOwner reports whether h is still the prober responsible for its identity.
+// A prober that has been superseded must stop publishing: its results describe
+// a configuration that is no longer in effect, and its series are now written
+// by its replacement.
+func (h *healthProber) isOwner() bool {
+	if !h.claimed {
+		return true
+	}
+	healthRegistry.mtx.Lock()
+	defer healthRegistry.mtx.Unlock()
+	return healthRegistry.owners[h.identity] == h
+}
+
+// release is called when the prober's context is cancelled. If h is still the
+// owner then the server group is genuinely going away (removed from the
+// config, or promxy shutting down) and its series must be retired: a left
+// behind `server_group_up 0` would keep metric-based outage alerts firing
+// forever. If a replacement has already claimed the identity, h must leave
+// those series alone -- they belong to the replacement now.
+func (h *healthProber) release() {
+	if !h.claimed {
+		return
+	}
+	healthRegistry.mtx.Lock()
+	stillOwner := healthRegistry.owners[h.identity] == h
+	if stillOwner {
+		delete(healthRegistry.owners, h.identity)
+	}
+	healthRegistry.mtx.Unlock()
+
+	if !stillOwner {
+		return
+	}
+
+	h.mtx.Lock()
+	targets := h.knownTargets
+	h.knownTargets = nil
+	h.firing = false
+	h.downSince = time.Time{}
+	h.lastSent = time.Time{}
+	h.mtx.Unlock()
+
+	ordinal, name := h.identity.ordinalString(), h.identity.name
+	for host := range targets {
+		deleteTargetMetrics(ordinal, name, host)
+	}
+	serverGroupUp.DeleteLabelValues(ordinal, name)
+	serverGroupTargetsUp.DeleteLabelValues(ordinal, name)
+	serverGroupLastSuccess.DeleteLabelValues(ordinal, name)
+}
+
+func deleteTargetMetrics(ordinal, name, host string) {
+	serverGroupTargetUp.DeleteLabelValues(ordinal, name, host)
+	serverGroupProbeDuration.DeleteLabelValues(ordinal, name, host)
+	serverGroupProbesTotal.DeleteLabelValues(ordinal, name, host, "success")
+	serverGroupProbesTotal.DeleteLabelValues(ordinal, name, host, "failure")
+}
+
 // start launches the probe loop the first time it is called; later calls are
 // no-ops, so repeated ApplyConfig cycles do not stack up goroutines. getState
 // and getCfg are called on each tick because both are republished as service
@@ -188,16 +316,19 @@ func (h *healthProber) start(ctx context.Context, getState func() *ServerGroupSt
 		return
 	}
 	h.startOnce.Do(func() {
+		// Claim ownership synchronously, before the goroutine starts: the
+		// caller's ApplyConfig ordering is what guarantees the replacement
+		// claims ahead of the predecessor's cancellation.
+		h.claim(identityForConfig(cfg))
 		go h.run(ctx, getState, getCfg, logger)
 	})
 }
 
 func (h *healthProber) run(ctx context.Context, getState func() *ServerGroupState, getCfg func() *Config, logger *logrus.Entry) {
+	defer h.release()
+
 	cfg := getCfg()
-	interval := cfg.HealthProbe.Interval
-	if interval <= 0 {
-		interval = DefaultHealthProbeInterval
-	}
+	interval := probeInterval(cfg)
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -213,6 +344,36 @@ func (h *healthProber) run(ctx context.Context, getState func() *ServerGroupStat
 			h.probeOnce(ctx, getState, getCfg, logger)
 		}
 	}
+}
+
+// probeInterval and probeTimeout resolve the configured timings, falling back
+// to the defaults for configs that were built in code rather than parsed from
+// YAML (UnmarshalYAML is what normally applies the defaults).
+func probeInterval(cfg *Config) time.Duration {
+	if cfg == nil || cfg.HealthProbe.Interval <= 0 {
+		return DefaultHealthProbeInterval
+	}
+	return cfg.HealthProbe.Interval
+}
+
+func probeTimeout(cfg *Config) time.Duration {
+	if cfg == nil || cfg.HealthProbe.Timeout <= 0 {
+		return DefaultHealthProbeTimeout
+	}
+	return cfg.HealthProbe.Timeout
+}
+
+// healthAlertExpiry is how long a firing alert stays valid in Alertmanager
+// without being refreshed. Alerts are only re-sent after a probe round, so a
+// long `interval` would otherwise let Alertmanager's resolve_timeout expire a
+// still-true alert between rounds; the expiry therefore covers several full
+// rounds. Prometheus does the same thing with 4 * ResendDelay.
+func healthAlertExpiry(cfg *Config) time.Duration {
+	refresh := healthResendInterval
+	if round := probeInterval(cfg) + probeTimeout(cfg); round > refresh {
+		refresh = round
+	}
+	return 4 * refresh
 }
 
 // probeOnce runs one round of probes across all targets and feeds the result
@@ -248,6 +409,19 @@ func (h *healthProber) probeOnce(ctx context.Context, getState func() *ServerGro
 		}(i)
 	}
 	wg.Wait()
+
+	// A reload cancels the old ServerGroup's context, which aborts in-flight
+	// probes with context.Canceled even against a perfectly healthy backend.
+	// Publishing that round would report a fabricated outage (and with
+	// `for: 0`, send an alert) on the way out. Individual probe timeouts are
+	// unaffected: those come from the per-probe deadline, not from ctx.
+	//
+	// The ownership check covers the same handover from the other side: once a
+	// replacement has claimed this group, these series and this alert belong
+	// to it.
+	if ctx.Err() != nil || !h.isOwner() {
+		return
+	}
 
 	upCount := 0
 	seen := make(map[string]struct{}, len(results))
@@ -294,10 +468,7 @@ func (h *healthProber) probeTarget(ctx context.Context, cfg *Config, t probeTarg
 	if query == "" {
 		query = DefaultHealthProbeQuery
 	}
-	timeout := cfg.HealthProbe.Timeout
-	if timeout <= 0 {
-		timeout = DefaultHealthProbeTimeout
-	}
+	timeout := probeTimeout(cfg)
 
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -324,10 +495,7 @@ func (h *healthProber) reconcileTargetMetrics(ordinal, name string, seen map[str
 		if _, ok := seen[host]; ok {
 			continue
 		}
-		serverGroupTargetUp.DeleteLabelValues(ordinal, name, host)
-		serverGroupProbeDuration.DeleteLabelValues(ordinal, name, host)
-		serverGroupProbesTotal.DeleteLabelValues(ordinal, name, host, "success")
-		serverGroupProbesTotal.DeleteLabelValues(ordinal, name, host, "failure")
+		deleteTargetMetrics(ordinal, name, host)
 	}
 	h.knownTargets = seen
 }
@@ -382,6 +550,9 @@ func (h *healthProber) updateAlertState(cfg *Config, groupUp bool, total, upCoun
 
 	alert := h.buildAlert(cfg, total, upCount, failures)
 	alert.StartsAt = h.downSince
+	// Carry an expiry far enough ahead that Alertmanager cannot resolve this
+	// alert between probe rounds; recovery resolves it explicitly.
+	alert.EndsAt = now.Add(healthAlertExpiry(cfg))
 	if !h.firing {
 		logger.Errorf("ServerGroup %s unreachable for %s; raising %s", configIdentifier(cfg), now.Sub(h.downSince).Truncate(time.Second), cfg.HealthProbe.AlertName)
 	}

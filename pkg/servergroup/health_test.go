@@ -3,6 +3,8 @@ package servergroup
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -293,8 +295,15 @@ func TestHealthProbeDetectsUnreachableBackend(t *testing.T) {
 	if got, want := a.Labels[alertLabelServerGroup], model.LabelValue("regional-adopted"); got != want {
 		t.Errorf("server_group = %q, want %q", got, want)
 	}
-	if !a.EndsAt.IsZero() {
-		t.Error("a firing alert must not carry EndsAt")
+	// A firing alert must carry a future expiry, not a zero EndsAt: alerts are
+	// only refreshed after a probe round, so with an interval longer than
+	// Alertmanager's resolve_timeout a zero EndsAt would let a still-true
+	// alert resolve itself between rounds.
+	if !a.EndsAt.After(time.Now()) {
+		t.Errorf("a firing alert must carry a future EndsAt, got %v", a.EndsAt)
+	}
+	if min := time.Now().Add(healthAlertExpiry(cfg) / 2); !a.EndsAt.After(min) {
+		t.Errorf("firing EndsAt = %v, want it to comfortably outlast the probe interval", a.EndsAt)
 	}
 	if !strings.Contains(string(a.Annotations["description"]), "i/o timeout") {
 		t.Errorf("description should carry the underlying error, got %q", a.Annotations["description"])
@@ -705,5 +714,217 @@ func TestSetHealthAlertSinkNilDetaches(t *testing.T) {
 	sendHealthAlerts(HealthAlert{})
 	if called != 1 {
 		t.Fatalf("detached sink still invoked, called = %d", called)
+	}
+}
+
+// TestHealthProbeCanceledRoundIsNotPublished covers the reload path: cancelling
+// the old ServerGroup's context aborts its in-flight probes with
+// context.Canceled even when the backend is perfectly healthy. That round
+// describes the shutdown, not the backend, and must not reach the metrics or
+// (with `for: 0`) Alertmanager.
+func TestHealthProbeCanceledRoundIsNotPublished(t *testing.T) {
+	getAlerts, cleanup := collectAlerts(t)
+	defer cleanup()
+
+	cfg := &Config{Ordinal: 31, Name: "canceled"}
+	cfg.HealthProbe = HealthProbeConfig{Enabled: true}
+	cfg.HealthProbe.applyDefaults()
+	cfg.HealthProbe.For = durPtr(0)
+
+	h, _, getState := newProbeFixture(t, cfg)
+	getCfg := func() *Config { return cfg }
+
+	upBefore := testutil.CollectAndCount(serverGroupUp)
+	targetsBefore := testutil.CollectAndCount(serverGroupTargetUp)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.probeOnce(ctx, getState, getCfg, testLogger())
+
+	if n := len(getAlerts()); n != 0 {
+		t.Fatalf("a round aborted by shutdown must not alert, got %d", n)
+	}
+	if got := testutil.CollectAndCount(serverGroupUp); got != upBefore {
+		t.Errorf("server_group_up series = %d, want %d (a canceled round must publish nothing)", got, upBefore)
+	}
+	if got := testutil.CollectAndCount(serverGroupTargetUp); got != targetsBefore {
+		t.Errorf("server_group_target_up series = %d, want %d (a canceled round must publish nothing)", got, targetsBefore)
+	}
+	h.mtx.Lock()
+	defer h.mtx.Unlock()
+	if !h.downSince.IsZero() || h.firing {
+		t.Fatalf("a canceled round must not advance the alert state machine (downSince=%v firing=%v)", h.downSince, h.firing)
+	}
+}
+
+// TestHealthProbeStatePersistsAcrossReload covers configuration reloads:
+// ProxyStorage builds a whole new set of ServerGroups and cancels the old
+// ones, so without an explicit handover an unchanged group would restart its
+// `for:` countdown on every reload and could never alert under a reload loop.
+func TestHealthProbeStatePersistsAcrossReload(t *testing.T) {
+	getAlerts, cleanup := collectAlerts(t)
+	defer cleanup()
+
+	cfg := &Config{Ordinal: 33, Name: "reloaded"}
+	cfg.HealthProbe = HealthProbeConfig{Enabled: true}
+	cfg.HealthProbe.applyDefaults()
+	cfg.HealthProbe.For = durPtr(time.Hour) // long enough that only a handover can satisfy it
+	getCfg := func() *Config { return cfg }
+
+	old, api, getState := newProbeFixture(t, cfg)
+	old.claim(identityForConfig(cfg))
+	defer old.release()
+
+	api.setErr(fmt.Errorf("backend down"))
+	old.probeOnce(context.Background(), getState, getCfg, testLogger())
+
+	old.mtx.Lock()
+	downSince := old.downSince
+	old.mtx.Unlock()
+	if downSince.IsZero() {
+		t.Fatal("precondition: the old prober should have recorded the outage")
+	}
+	// Pretend the outage started well before `for`, as it would have in a
+	// long-running process.
+	old.mtx.Lock()
+	old.downSince = time.Now().Add(-2 * time.Hour)
+	old.mtx.Unlock()
+
+	// Reload: a replacement claims the identity, then the old one shuts down.
+	replacement, _, _ := newProbeFixture(t, cfg)
+	replacement.claim(identityForConfig(cfg))
+	defer replacement.release()
+	old.release()
+
+	replacement.mtx.Lock()
+	adopted := replacement.downSince
+	replacement.mtx.Unlock()
+	if adopted.IsZero() {
+		t.Fatal("the replacement must inherit the ongoing outage, not restart the `for` countdown")
+	}
+
+	// The old prober is no longer the owner, so its shutdown must not have
+	// deleted the group's series, and the replacement alerts on the next
+	// round because the inherited downSince already satisfies `for`.
+	replacement.probeOnce(context.Background(), getState, getCfg, testLogger())
+	if n := len(getAlerts()); n != 1 {
+		t.Fatalf("expected the inherited outage to fire, got %d alerts", n)
+	}
+	if got := testutil.ToFloat64(serverGroupUp.WithLabelValues("33", "reloaded")); got != 0 {
+		t.Fatalf("server_group_up = %v, want 0 (the replacement owns the series)", got)
+	}
+}
+
+// TestHealthProbeRetiresSeriesWhenGroupGoesAway is the other half of the
+// handover: a group actually removed from the config must not leave
+// `server_group_up 0` behind, or metric-based outage alerts fire forever.
+func TestHealthProbeRetiresSeriesWhenGroupGoesAway(t *testing.T) {
+	_, cleanup := collectAlerts(t)
+	defer cleanup()
+
+	cfg := &Config{Ordinal: 35, Name: "removed"}
+	cfg.HealthProbe = HealthProbeConfig{Enabled: true}
+	cfg.HealthProbe.applyDefaults()
+	cfg.HealthProbe.For = durPtr(0)
+	getCfg := func() *Config { return cfg }
+
+	h, api, getState := newProbeFixture(t, cfg)
+	upBefore := testutil.CollectAndCount(serverGroupUp)
+	targetsBefore := testutil.CollectAndCount(serverGroupTargetUp)
+
+	h.claim(identityForConfig(cfg))
+	api.setErr(fmt.Errorf("backend down"))
+	h.probeOnce(context.Background(), getState, getCfg, testLogger())
+
+	if got := testutil.ToFloat64(serverGroupUp.WithLabelValues("35", "removed")); got != 0 {
+		t.Fatalf("precondition: server_group_up = %v, want 0", got)
+	}
+	if got := testutil.CollectAndCount(serverGroupUp); got != upBefore+1 {
+		t.Fatalf("precondition: server_group_up series = %d, want %d", got, upBefore+1)
+	}
+
+	h.release()
+
+	if got := testutil.CollectAndCount(serverGroupUp); got != upBefore {
+		t.Errorf("server_group_up series = %d, want %d: a removed group must not leave `server_group_up 0` behind", got, upBefore)
+	}
+	if got := testutil.CollectAndCount(serverGroupTargetUp); got != targetsBefore {
+		t.Errorf("server_group_target_up series = %d, want %d: per-target series must be retired too", got, targetsBefore)
+	}
+}
+
+// TestHealthProbeClientBypassesQueryFilters pins the probe's independence from
+// the layers that shape user query results. A backend configured with
+// `relative_time_range.end: -1h` (or a fail-closed label_filter) answers a
+// probe at the current time locally, with an empty, error-free result and no
+// request on the wire -- so the probe would report a dead backend as healthy.
+func TestHealthProbeClientBypassesQueryFilters(t *testing.T) {
+	var mtx sync.Mutex
+	var paths []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mtx.Lock()
+		paths = append(paths, r.URL.Path)
+		mtx.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
+	}))
+	defer backend.Close()
+
+	end := -time.Hour
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte(fmt.Sprintf(`
+scheme: http
+relative_time_range:
+  end: %s
+health_probe:
+  enabled: true
+static_configs:
+  - targets: ["%s"]
+`, end, strings.TrimPrefix(backend.URL, "http://"))), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg.Ordinal = 37
+	cfg.Name = "filtered"
+
+	sg, err := NewServerGroup()
+	if err != nil {
+		t.Fatalf("NewServerGroup: %v", err)
+	}
+	defer sg.Cancel()
+	if err := sg.ApplyConfig(cfg); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+
+	// Service discovery publishes the state asynchronously.
+	var state *ServerGroupState
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if state = sg.State(); state != nil && len(state.probeTargets) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state == nil || len(state.probeTargets) != 1 {
+		t.Fatalf("expected exactly one probe target, state = %#v", state)
+	}
+
+	// Sanity check that the filter really is active on the query path, so this
+	// test fails for the right reason if that behaviour ever changes.
+	if ss := state.apiClient.Query(context.Background(), "1", time.Now()); ss.Err() != nil {
+		t.Fatalf("query client error: %v", ss.Err())
+	}
+	mtx.Lock()
+	viaQueryPath := len(paths)
+	mtx.Unlock()
+	if viaQueryPath != 0 {
+		t.Skip("relative_time_range no longer short-circuits a now() query; test premise is stale")
+	}
+
+	if ss := state.probeTargets[0].API.Query(context.Background(), "1", time.Now()); ss.Err() != nil {
+		t.Fatalf("probe client error: %v", ss.Err())
+	}
+	mtx.Lock()
+	defer mtx.Unlock()
+	if len(paths) == 0 {
+		t.Fatal("the probe never reached the backend: it is inheriting the query-path time filter")
 	}
 }
