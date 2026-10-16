@@ -131,6 +131,14 @@ type ServerGroupState struct {
 	// metadata cache, which fetches from one target per HA key).
 	multiAPI *promclient.MultiAPI
 
+	// probeTargets pairs each discovered target with its own API client, for
+	// the health probe. These are built from the bare per-target client:
+	// neither the group-level IgnoreError/DowngradeError wrappers (which
+	// deliberately hide a backend's failures from user queries) nor the
+	// per-target time-range and label filters (which can answer a probe
+	// without ever contacting the backend) are applied.
+	probeTargets []probeTarget
+
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 }
@@ -161,6 +169,10 @@ type ServerGroup struct {
 	// is > 0; when zero, the cache stays empty and IsHistogramMetric always
 	// returns false (AST-only routing). See pkg/servergroup/histogram_cache.go.
 	histogramCache histogramMetadataCache
+
+	// healthProber runs the active liveness probe for this group when
+	// health_probe is enabled. See pkg/servergroup/health.go.
+	healthProber healthProber
 }
 
 // IsHistogramMetric reports whether the given metric name is known to be a
@@ -297,6 +309,7 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 
 	targets := make([]string, 0)
 	apiClients := make([]promclient.API, 0)
+	probeTargets := make([]probeTarget, 0)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	oldState := s.State()
@@ -381,6 +394,19 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					apiClient = &promclient.PromAPIRemoteRead{apiClient, remoteStorageClient}
 				}
 
+				// Snapshot the client for the health probe here, with the
+				// transport, authentication and query params already applied
+				// but before the layers below. Those layers exist to shape
+				// user query results and every one of them can make a probe
+				// succeed against a backend that is down: a time filter such
+				// as `relative_time_range.end: -1h` or a fail-closed
+				// label_filter turns the probe into an empty, error-free
+				// result that never reaches the backend at all. Matcher
+				// injection is re-applied to this client below, since it is
+				// part of how the target is addressed rather than a filter on
+				// the answer.
+				probeAPIClient := apiClient
+
 				// Optionally add time range layers
 				if cfg.AbsoluteTimeRangeConfig != nil {
 					apiClient = &promclient.AbsoluteTimeFilter{
@@ -426,6 +452,10 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 					if err != nil {
 						return err
 					}
+					probeAPIClient, err = promclient.NewInjectMatchersClient(probeAPIClient, injectMatchers)
+					if err != nil {
+						return err
+					}
 				}
 
 				// Add labels
@@ -450,7 +480,16 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 				}
 
 				// Add wrap for the specific target, and add to the list
-				apiClients = append(apiClients, &promclient.ErrorWrap{apiClient, "error in target=" + u.String()})
+				wrapped := &promclient.ErrorWrap{apiClient, "error in target=" + u.String()}
+				apiClients = append(apiClients, wrapped)
+				// The probe gets its own client: it must see the raw
+				// reachability of the target, not the filtered view the user
+				// queries get, and not the group-level error-suppressing
+				// wrappers applied below.
+				probeTargets = append(probeTargets, probeTarget{
+					Host: u.Host,
+					API:  &promclient.ErrorWrap{probeAPIClient, "error in health probe target=" + u.String()},
+				})
 			}
 		}
 	}
@@ -468,10 +507,11 @@ func (s *ServerGroup) loadTargetGroupMap(targetGroupMap map[string][]*targetgrou
 	newState := &ServerGroupState{
 		Targets: targets,
 		// Add error wrap for this specific servergroup
-		apiClient: &promclient.ErrorWrap{apiClient, fmt.Sprintf("error in servergroup ord=%d", cfg.Ordinal)},
-		multiAPI:  apiClient,
-		ctx:       ctx,
-		ctxCancel: ctxCancel,
+		apiClient:    &promclient.ErrorWrap{apiClient, fmt.Sprintf("error in servergroup ord=%d", cfg.Ordinal)},
+		multiAPI:     apiClient,
+		probeTargets: probeTargets,
+		ctx:          ctx,
+		ctxCancel:    ctxCancel,
 	}
 
 	if cfg.IgnoreError {
@@ -614,6 +654,20 @@ func (s *ServerGroup) ApplyConfig(cfg *Config) error {
 		cfg.NativeHistogram.MetadataRefresh,
 		logrus.WithFields(logrus.Fields{
 			"component": "histogram-metadata-cache",
+			"sg":        cfg.Ordinal,
+		}),
+	)
+
+	// Start the health probe if configured. Like the metadata cache, start is
+	// idempotent across ApplyConfig cycles; the loop re-reads the config on
+	// every tick, so a reload that only changes probe timings or alert labels
+	// is picked up without a restart.
+	s.healthProber.start(
+		s.ctx,
+		s.State,
+		s.Config,
+		logrus.WithFields(logrus.Fields{
+			"component": "servergroup-health-probe",
 			"sg":        cfg.Ordinal,
 		}),
 	)

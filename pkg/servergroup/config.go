@@ -259,6 +259,17 @@ type Config struct {
 	// (see https://github.com/jacksontj/promxy/issues/643)
 	HTTPClientHeaders map[string]string `yaml:"http_headers"`
 
+	// HealthProbe configures an active liveness probe against the targets of
+	// this server group. It exists because a server group that is simply
+	// unreachable is otherwise indistinguishable from one that holds no data:
+	// with `ignore_error: true` (the common configuration for a non-required
+	// backend) promxy swallows the transport error and returns an empty result,
+	// so every alerting rule evaluated over that backend's data silently goes
+	// from firing to inactive rather than reporting the outage.
+	//
+	// The probe is off by default; see HealthProbeConfig.
+	HealthProbe HealthProbeConfig `yaml:"health_probe,omitempty"`
+
 	// AlignQueryRangeWithStep declares that this backend snaps query_range results
 	// to the epoch step grid (k*step), as Mimir/Cortex do by default. When set,
 	// promxy re-stamps the returned samples back onto the grid implied by the
@@ -273,6 +284,159 @@ type Config struct {
 // GetScheme returns the scheme for this servergroup
 func (c *Config) GetScheme() string {
 	return c.Scheme
+}
+
+// Default values for HealthProbeConfig. Exposed as vars so tests can tighten
+// the timings without re-deriving the defaults.
+var (
+	// DefaultHealthProbeInterval is how often each target is probed.
+	DefaultHealthProbeInterval = 15 * time.Second
+	// DefaultHealthProbeTimeout bounds a single probe. It must stay well under
+	// the interval so a hung backend cannot stall the loop into the next tick.
+	DefaultHealthProbeTimeout = 5 * time.Second
+	// DefaultHealthProbeFor is how long a group must be continuously down
+	// before an alert is raised, mirroring the `for:` clause of an alerting
+	// rule. It damps flapping across a single failed probe.
+	DefaultHealthProbeFor = 1 * time.Minute
+	// DefaultHealthProbeQuery is the instant query used as the probe. A bare
+	// scalar is the cheapest expression that still exercises the full path:
+	// DNS, TCP, TLS, auth, routing and the downstream's query engine.
+	DefaultHealthProbeQuery = "1"
+	// DefaultHealthProbeAlertName is the alert raised when a group is down.
+	DefaultHealthProbeAlertName = "PromxyServerGroupDown"
+)
+
+// HealthProbeConfig configures an active liveness probe for a server group.
+//
+// Two independent outputs are produced, because they fail in different ways:
+//
+//   - Metrics (`server_group_up`, `server_group_target_up`, ...) on promxy's
+//     own /metrics endpoint. Useful for dashboards and for alerting rules —
+//     but only if something scrapes promxy and stores the result somewhere
+//     still readable during the outage. When promxy's only server group is the
+//     backend that just went away, that condition does not hold.
+//
+//   - An alert pushed straight to the configured Alertmanagers, bypassing
+//     storage and rule evaluation entirely. This is the path that survives the
+//     failure it is reporting, which is the whole point of the feature. See
+//     SendAlerts.
+//
+// The probe is opt-in: enabling it adds one cheap query per target per
+// interval, which is not free on a large fan-out, and promxy has historically
+// made no requests of its own.
+type HealthProbeConfig struct {
+	// Enabled turns the probe on for this server group.
+	Enabled bool `yaml:"enabled"`
+
+	// Interval is how often each target is probed. Defaults to
+	// DefaultHealthProbeInterval.
+	Interval time.Duration `yaml:"interval,omitempty"`
+
+	// Timeout bounds a single probe. Defaults to DefaultHealthProbeTimeout.
+	Timeout time.Duration `yaml:"timeout,omitempty"`
+
+	// For is how long the whole group must be continuously down before an
+	// alert is raised. Defaults to DefaultHealthProbeFor. Set it explicitly to
+	// 0 to alert on the first failed probe.
+	//
+	// A pointer so that an omitted field is distinguishable from an explicit
+	// `for: 0`; the former must get the flap-damping default, the latter must
+	// be honoured as "alert immediately".
+	For *time.Duration `yaml:"for,omitempty"`
+
+	// Query is the instant query sent as the probe. Defaults to
+	// DefaultHealthProbeQuery.
+	Query string `yaml:"query,omitempty"`
+
+	// SendAlerts controls whether a down group is pushed directly to the
+	// configured Alertmanagers. Defaults to true when the probe is enabled.
+	//
+	// This is deliberately not routed through the rule manager: a rule is
+	// evaluated against the federated view of the server groups, so an alert
+	// about an unreachable group would have to read its own evidence from the
+	// group that is unreachable. Pushing from the probe loop keeps the alert
+	// independent of the thing it reports on.
+	SendAlerts *bool `yaml:"send_alerts,omitempty"`
+
+	// AlertName is the value of the `alertname` label. Defaults to
+	// DefaultHealthProbeAlertName.
+	AlertName string `yaml:"alert_name,omitempty"`
+
+	// AlertLabels are extra labels attached to the raised alert, e.g.
+	// `severity: critical` or a routing key. The probe's own labels
+	// (alertname, server_group, server_group_ordinal) take precedence.
+	AlertLabels map[string]string `yaml:"alert_labels,omitempty"`
+
+	// AlertAnnotations are extra annotations attached to the raised alert,
+	// e.g. a runbook or dashboard link. The probe's own `summary` and
+	// `description` take precedence, since they carry the diagnostic detail.
+	//
+	// Note that these are emitted verbatim: this alert is pushed straight to
+	// Alertmanager rather than evaluated by the rule manager, so there is no
+	// rule-templating pass and `{{ $labels.foo }}` references would arrive
+	// unexpanded. Use literal values.
+	AlertAnnotations map[string]string `yaml:"alert_annotations,omitempty"`
+}
+
+// applyDefaults fills in the zero-valued fields. Called from UnmarshalYAML so
+// that everything downstream can read the config without re-deriving defaults.
+func (h *HealthProbeConfig) applyDefaults() {
+	if h.Interval <= 0 {
+		h.Interval = DefaultHealthProbeInterval
+	}
+	if h.Timeout <= 0 {
+		h.Timeout = DefaultHealthProbeTimeout
+	}
+	if h.For == nil {
+		d := DefaultHealthProbeFor
+		h.For = &d
+	} else if *h.For < 0 {
+		d := DefaultHealthProbeFor
+		h.For = &d
+	}
+	if h.Query == "" {
+		h.Query = DefaultHealthProbeQuery
+	}
+	if h.AlertName == "" {
+		h.AlertName = DefaultHealthProbeAlertName
+	}
+	if h.SendAlerts == nil {
+		enabled := true
+		h.SendAlerts = &enabled
+	}
+}
+
+// ForDuration returns how long a group must be continuously down before an
+// alert is raised, resolving the unset case to the default. Safe on a
+// zero-valued config.
+func (h *HealthProbeConfig) ForDuration() time.Duration {
+	if h.For == nil {
+		return DefaultHealthProbeFor
+	}
+	return *h.For
+}
+
+// ShouldSendAlerts reports whether a down group should be pushed to
+// Alertmanager. Safe on a zero-valued config.
+func (h *HealthProbeConfig) ShouldSendAlerts() bool {
+	return h.Enabled && (h.SendAlerts == nil || *h.SendAlerts)
+}
+
+// validate checks the probe config for self-contradictory timings.
+func (h *HealthProbeConfig) validate() error {
+	if !h.Enabled {
+		return nil
+	}
+	// A timeout at or above the interval lets a slow backend keep a probe in
+	// flight across the next tick, which would make the observed probe rate
+	// silently lower than configured.
+	if h.Timeout >= h.Interval {
+		return fmt.Errorf("health_probe.timeout (%s) must be less than health_probe.interval (%s)", h.Timeout, h.Interval)
+	}
+	if f := h.ForDuration(); f > 0 && f < h.Interval {
+		return fmt.Errorf("health_probe.for (%s) must be >= health_probe.interval (%s), otherwise it can never be satisfied", f, h.Interval)
+	}
+	return nil
 }
 
 // GetAntiAffinity returns the AntiAffinity time for this servergroup
@@ -319,6 +483,11 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	// Validate inject_matchers parses at config-load time rather than failing later
 	// during a discovery sync.
 	if _, err := c.GetInjectMatchers(); err != nil {
+		return err
+	}
+
+	c.HealthProbe.applyDefaults()
+	if err := c.HealthProbe.validate(); err != nil {
 		return err
 	}
 
