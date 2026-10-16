@@ -52,6 +52,7 @@ import (
 	"github.com/jacksontj/promxy/pkg/logging"
 	"github.com/jacksontj/promxy/pkg/middleware"
 	"github.com/jacksontj/promxy/pkg/proxystorage"
+	"github.com/jacksontj/promxy/pkg/ruleshard"
 	"github.com/jacksontj/promxy/pkg/server"
 )
 
@@ -116,6 +117,9 @@ type cliOpts struct {
 	ResendDelay               time.Duration `long:"rules.alert.resend-delay" description:"Minimum amount of time to wait before resending an alert to Alertmanager." default:"1m"`
 	AlertBackfill             bool          `long:"rules.alertbackfill" description:"Enable promxy to recalculate alert state on startup when the downstream datastore doesn't have an ALERTS_FOR_STATE"`
 
+	RuleShardCount int    `long:"rules.shard-count" description:"Number of promxy replicas that rule groups are distributed across. Each rule group is evaluated by exactly one shard. 1 (the default) disables sharding, meaning every replica evaluates every rule." default:"1"`
+	RuleShardIndex string `long:"rules.shard-index" description:"This replica's rule shard index, in [0, rules.shard-count). 'auto' derives it from $PROMXY_SHARD_INDEX, else the trailing ordinal of $POD_NAME or the hostname (e.g. 'promxy-2' -> 2)." default:"auto"`
+
 	ShutdownDelay   time.Duration `long:"http.shutdown-delay" description:"time to wait before shutting down the http server, this allows for a grace period for upstreams (e.g. LoadBalancers) to discover the new stopping status through healthchecks" default:"10s"`
 	ShutdownTimeout time.Duration `long:"http.shutdown-timeout" description:"max time to wait for a graceful shutdown of the HTTP server" default:"60s"`
 }
@@ -163,6 +167,17 @@ func reloadConfig(noStepSuqueryInterval *safePromQLNoStepSubqueryInterval, notif
 	noStepSuqueryInterval.Set(cfg.PromConfig.GlobalConfig.EvaluationInterval)
 	reloadTime.Set(float64(time.Now().Unix()))
 	return nil
+}
+
+// hasAlertingRule reports whether any loaded rule is an alerting rule. Only
+// those have `for` state that can be lost when a group changes owner.
+func hasAlertingRule(ruleList []rules.Rule) bool {
+	for _, rule := range ruleList {
+		if _, ok := rule.(*rules.AlertingRule); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
@@ -349,6 +364,23 @@ func main() {
 		return alertTemplates.Apply(cfg.AlertTemplates)
 	}})
 
+	// Rule sharding: decide which rule groups this replica is responsible for.
+	// With sharding disabled (the default) the sharder owns everything and the
+	// eval hook below is nil, keeping the rules manager on its stock code path.
+	shardIndex, err := ruleshard.ResolveIndex(opts.RuleShardIndex, opts.RuleShardCount)
+	if err != nil {
+		logrus.Fatalf("error resolving rule shard index: %v", err)
+	}
+	sharder, err := ruleshard.New(shardIndex, opts.RuleShardCount)
+	if err != nil {
+		logrus.Fatalf("error configuring rule sharding: %v", err)
+	}
+	shardMetrics := ruleshard.NewMetrics(prometheus.DefaultRegisterer)
+	shardMetrics.SetShard(sharder)
+	if sharder.Enabled() {
+		logrus.Infof("rule sharding enabled: this replica is shard %d of %d", sharder.Index(), sharder.Count())
+	}
+
 	ruleManager := rules.NewManager(&rules.ManagerOptions{
 		Context:         ctx,         // base context for all background tasks
 		ExternalURL:     externalUrl, // URL listed as URL for "who fired this alert"
@@ -380,22 +412,65 @@ func main() {
 			}
 			files = append(files, fs...)
 		}
-		if err := ruleManager.Update(time.Duration(cfg.GlobalConfig.EvaluationInterval), files, cfg.GlobalConfig.ExternalLabels, externalUrl.String(), nil); err != nil {
+		if sharder.Enabled() {
+			// Owns() hashes rule-file base names, so colliding base names across
+			// directories skew the distribution. This is not a correctness
+			// problem (every replica still agrees on ownership) so we warn
+			// rather than reject an otherwise valid config.
+			if err := ruleshard.CheckFileCollisions(files); err != nil {
+				logrus.Warningf("rule sharding: %v", err)
+			}
+
+			// Validate the remote_write prerequisite *before* handing the new
+			// rules to the manager. Manager.Update swaps in and starts the new
+			// groups immediately, and reloadConfig does not roll reloadables
+			// back on error, so a check made afterwards would report a refusal
+			// while leaving the refused rules running.
+			//
+			// Under sharding each group has exactly one evaluator, so a group
+			// moving between replicas (rescale, rolling restart, reschedule)
+			// takes its pending `for` state with it. Without remote_write there
+			// is no ALERTS_FOR_STATE downstream for the new owner to restore
+			// from, so every such move silently resets `for` timers and delays
+			// alerts.
+			//
+			// len() rather than nil: an explicit `remote_write: []` parses to a
+			// non-nil empty slice but configures no endpoint.
+			if len(files) > 0 && len(cfg.RemoteWriteConfigs) == 0 {
+				return fmt.Errorf("rules.shard-count > 1 requires a remote_write endpoint so that alert `for` state survives a rule group moving between shards")
+			}
+		}
+
+		if err := ruleManager.Update(time.Duration(cfg.GlobalConfig.EvaluationInterval), files, cfg.GlobalConfig.ExternalLabels, externalUrl.String(), sharder.EvalIterationFunc(shardMetrics)); err != nil {
 			return err
 		}
 
-		if cfg.RemoteWriteConfigs == nil {
-			ruleList := ruleManager.Rules()
+		if owned := shardMetrics.SyncGroups(sharder, ruleManager.RuleGroups()); sharder.Enabled() {
+			logrus.Infof("rule sharding: shard %d/%d owns %d of %d rule groups", sharder.Index(), sharder.Count(), owned, len(ruleManager.RuleGroups()))
+		}
+
+		if len(cfg.RemoteWriteConfigs) == 0 {
+			alertingRules := 0
 			// check for any recording rules, if we find any lets log a fatal and stop
-			for _, rule := range ruleList {
+			for _, rule := range ruleManager.Rules() {
 				if _, ok := rule.(*rules.RecordingRule); ok {
 					return fmt.Errorf("promxy doesn't support recording rules: %s", rule)
 				}
+				if _, ok := rule.(*rules.AlertingRule); ok {
+					alertingRules++
+				}
 			}
 
-			if len(ruleList) > 0 {
+			if alertingRules > 0 {
 				logrus.Warning("Alerting rules are configured but no remote_write endpoint is configured.")
 			}
+		}
+
+		// Only alerting rules carry `for` state, so a recording-rule-only
+		// sharded setup has nothing to lose when a group moves and must not be
+		// nagged about enabling alert backfill.
+		if sharder.Enabled() && !opts.AlertBackfill && hasAlertingRule(ruleManager.Rules()) {
+			logrus.Warning("rule sharding is enabled without --rules.alertbackfill; alert `for` state will be lost whenever a rule group moves between shards")
 		}
 
 		return nil

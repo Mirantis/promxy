@@ -94,6 +94,84 @@ you wanted to know that the global error rate was <10% this would be impossible 
 to use recording rules (or see the metrics from alerting rules) a [remote_write](https://github.com/jacksontj/promxy/blob/master/cmd/promxy/config.yaml#L22)
 endpoint must be defined in the promxy config (which is where it will send those metrics).
 
+### What happens to rules if I run more than one promxy replica?
+By default, **every replica evaluates every rule**. For alerting rules that is usually fine: each replica emits
+identical alerts and Alertmanager deduplicates them by fingerprint, which is the same HA model used by a pair of
+redundant Prometheus servers. For recording rules it is not fine -- every replica writes the same series to your
+`remote_write` endpoint, so N replicas produce N copies of each sample.
+
+To spread the work instead of duplicating it, use **rule sharding**:
+
+```
+--rules.shard-count=3    # number of replicas participating
+--rules.shard-index=auto # defaults to 'auto'
+```
+
+Each rule *group* is assigned to exactly one shard, so the replicas partition the rule set between them with no
+leader election, no coordination and no shared state: the assignment is a pure function of the group's identity and
+the shard count, which every replica computes independently. Assignment uses rendezvous hashing, so resizing from
+`old` to `new` shards only reassigns roughly `abs(old-new)/max(old,new)` of the groups rather than nearly all of
+them. Adding or removing a single shard therefore moves about `1/max(old,new)` of the groups; bigger jumps move
+proportionally more (3 -> 6 moves about half).
+
+Groups that belong to another shard are still loaded and visible in `/api/v1/rules`, they are simply not evaluated
+locally.
+
+#### Shards are balanced in expectation, not in practice
+
+Rendezvous hashing distributes groups uniformly *in expectation*, but a rule set has tens of groups, not millions,
+and at that scale the variance is plainly visible. A real 48-group rule set splits like this:
+
+| `--rules.shard-count` | groups per shard |
+| --- | --- |
+| 3 | 15, 12, 21 |
+| 4 | 12, 10, 18, 8 |
+
+That is a 2.25x spread between the busiest and quietest replica at `shard-count=4`. Actual CPU skew will be *worse*
+than the group-count skew, because groups are not equally expensive: a group of twenty SLO rules over a long range
+costs far more to evaluate than a group with one `up == 0` alert, and sharding is group-granular and cost-blind.
+
+This is inherent to the design and is not a bug. Do not size replicas on the assumption that N shards each do `1/N`
+of the work -- size them so that the *busiest* shard fits, and expect the others to idle. Sharding is still a large
+improvement over the unsharded default, where every replica does **all** of the work and duplicates every recording
+rule sample; a 2.25x spread across 3-4 replicas is strictly better than a 3-4x duplication across all of them.
+
+Use `promxy_rule_groups_owned` to see the actual split, and `prometheus_rule_group_last_duration_seconds` summed per
+replica to see the real cost distribution rather than the group count. If one shard is persistently hot, splitting
+its largest group into several smaller groups in your rule files gives the hash more, finer units to work with and
+will usually even things out.
+
+The shard index is resolved from, in order: `--rules.shard-index`, `$PROMXY_SHARD_INDEX`, the trailing ordinal of
+`$POD_NAME`, or the trailing ordinal of the hostname (so a Kubernetes StatefulSet pod `promxy-2` becomes shard 2).
+If none of those yield an index, promxy **fails to start** rather than defaulting to 0 -- a silent default would put
+every replica on shard 0, leaving most of the rule set evaluated nowhere at all.
+
+Operational requirements when `--rules.shard-count` > 1:
+
+* A `remote_write` endpoint is **required** (promxy will refuse to start without one). Under sharding each group has
+  a single evaluator, so a group moving between replicas (rescale, rolling restart, reschedule) takes its pending
+  `for` state with it; `remote_write` is what puts `ALERTS_FOR_STATE` somewhere the new owner can read it back.
+* `--rules.alertbackfill` is strongly recommended for the same reason -- it is what restores that state. promxy warns
+  if you enable sharding without it.
+* Use a **StatefulSet** (or inject `PROMXY_SHARD_INDEX` via the Downward API) so shard indices are stable across
+  restarts.
+* Do **not** autoscale a sharded ruler. Changing the replica count without changing `--rules.shard-count` orphans
+  groups, and changing `--rules.shard-count` reshuffles assignments.
+* There is no replication: if a replica is down, its groups are not evaluated until it returns. Alerting rules with a
+  `for` duration tolerate brief outages naturally, but plan rescheduling accordingly.
+
+A common deployment is to split the two concerns: a sharded StatefulSet with `rule_files` + `remote_write` for rule
+evaluation, and a separately scaled, query-only Deployment with no `rule_files`.
+
+These metrics expose the assignment:
+
+| Metric | Meaning |
+| --- | --- |
+| `promxy_rules_shard_index` / `promxy_rules_shard_count` | This replica's shard identity |
+| `promxy_rule_group_shard_owned{rule_group_file,rule_group}` | 1 if this replica evaluates the group, 0 otherwise. Summed across replicas this should be exactly 1 for every group -- a group summing to 0 is being evaluated nowhere |
+| `promxy_rule_groups_owned` | Number of groups this replica evaluates |
+| `promxy_rule_group_evaluations_skipped_total` | Iterations skipped because the group belongs to another shard |
+
 ### What happens when an entire ServerGroup is unavailable?
 The default behavior in the event of a servergroup being down is to return an error. If all nodes in a servergroup
 are down the resulting data can be inaccurate (missing data, etc.) -- so we'd rather by default return an error 
