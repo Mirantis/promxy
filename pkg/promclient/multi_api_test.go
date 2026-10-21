@@ -2,7 +2,9 @@ package promclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"reflect"
 	"slices"
 	"sort"
@@ -15,8 +17,11 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/jacksontj/promxy/pkg/promapi"
 )
 
 type stubAPI struct {
@@ -1080,4 +1085,203 @@ func TestMultiAPIMergeIndependentOfCompletionOrder(t *testing.T) {
 			return v
 		})
 	})
+}
+
+// errClass names the API status class an error maps to, mirroring the
+// vendored API's returnAPIError.
+func errClass(err error) string {
+	switch errorRank(err) {
+	case rankCanceled:
+		return "canceled"
+	case rankStorage:
+		return "storage"
+	case rankTimeout:
+		return "timeout"
+	}
+	return "refused"
+}
+
+func TestNormalizePromError(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    error
+		want  string // the normalized error's message
+		class string
+	}{
+		{
+			name: "v1_json_timeout_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"timeout","error":"query timed out in expression evaluation"}`},
+			want: "query timed out in expression evaluation", class: "timeout",
+		},
+		{
+			name: "v1_json_canceled_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"canceled","error":"query was canceled in expression evaluation"}`},
+			want: "query was canceled in expression evaluation", class: "canceled",
+		},
+		{
+			name: "v1_json_internal_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 500", Detail: `{"status":"error","errorType":"internal","error":"boom"}`},
+			want: "server_error: server error: 500: internal: boom", class: "storage",
+		},
+		{
+			name: "v1_json_execution_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"execution","error":"boom"}`},
+			want: "server_error: server error: 503: execution: boom", class: "refused",
+		},
+		{
+			name: "v1_plain_text_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: "too many outstanding requests\n"},
+			want: "server_error: server error: 503: too many outstanding requests", class: "storage",
+		},
+		{
+			name: "v1_429_no_body",
+			in:   &v1.Error{Type: v1.ErrClient, Msg: "client error: 429"},
+			want: "client_error: client error: 429", class: "storage",
+		},
+		{
+			name: "v1_bad_response",
+			in:   &v1.Error{Type: v1.ErrBadResponse, Msg: "invalid character 'x'"},
+			want: "bad_response: invalid character 'x'", class: "storage",
+		},
+		{
+			name: "v1_execution",
+			in:   &v1.Error{Type: v1.ErrExec, Msg: "boom"},
+			want: "execution: boom", class: "refused",
+		},
+		{
+			name: "v1_bad_data",
+			in:   &v1.Error{Type: v1.ErrBadData, Msg: "parse error"},
+			want: "bad_data: parse error", class: "refused",
+		},
+		{
+			name: "promapi_timeout",
+			in:   &promapi.ResponseError{Type: "timeout", Msg: "query timed out in expression evaluation"},
+			want: "query timed out in expression evaluation", class: "timeout",
+		},
+		{
+			name: "promapi_canceled",
+			in:   &promapi.ResponseError{Type: "canceled", Msg: "query was canceled in expression evaluation"},
+			want: "query was canceled in expression evaluation", class: "canceled",
+		},
+		{
+			name: "promapi_unavailable",
+			in:   &promapi.ResponseError{Type: "unavailable", Msg: "TSDB not ready"},
+			want: "unavailable: TSDB not ready", class: "storage",
+		},
+		{
+			name: "promapi_execution",
+			in:   &promapi.ResponseError{Type: "execution", Msg: "boom"},
+			want: "execution: boom", class: "refused",
+		},
+		{
+			name: "promapi_bad_response",
+			in:   &promapi.ResponseError{Type: "bad_response", Msg: "ReadObject: ..."},
+			want: "bad_response: ReadObject: ...", class: "storage",
+		},
+		{
+			name: "promapi_http_error",
+			in:   &promapi.HTTPError{StatusCode: 429, Body: "slow down"},
+			want: "server returned HTTP status 429 Too Many Requests: slow down", class: "storage",
+		},
+		{
+			name: "connection_refused",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: errors.New("dial tcp: connection refused")},
+			want: `Post "http://x": dial tcp: connection refused`, class: "storage",
+		},
+		{
+			name: "transport_timeout",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: timeoutErr{}},
+			want: `query timed out in Post "http://x": timeout awaiting response headers`, class: "timeout",
+		},
+		{
+			name: "deadline_exceeded",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: context.DeadlineExceeded},
+			want: `query timed out in Post "http://x": context deadline exceeded`, class: "timeout",
+		},
+		{
+			// The request's own context: the client went away.
+			name: "context_canceled",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: context.Canceled},
+			want: `Post "http://x": context canceled`, class: "canceled",
+		},
+		{
+			name: "unknown",
+			in:   errors.New("promxy refused this itself"),
+			want: "promxy refused this itself", class: "refused",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizePromError(tc.in)
+			if got.Error() != tc.want {
+				t.Errorf("got %q, want %q", got.Error(), tc.want)
+			}
+			if c := errClass(got); c != tc.class {
+				t.Errorf("%T classified %s, want %s", got, c, tc.class)
+			}
+			// Normalizing is idempotent, including through ErrorWrap's context.
+			wrapped := (&ErrorWrap{Msg: "error in target=x"}).wrap(got)
+			if again := NormalizePromError(wrapped); again != wrapped {
+				t.Errorf("normalizing again changed %v to %v", wrapped, again)
+			}
+		})
+	}
+
+	if NormalizePromError(nil) != nil {
+		t.Error("nil did not stay nil")
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "timeout awaiting response headers" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+func TestErrorPicker(t *testing.T) {
+	var (
+		refused  = errors.New("execution: boom")
+		timeout  = promql.ErrQueryTimeout("x")
+		storage  = promql.ErrStorage{Err: errors.New("connection refused")}
+		canceled = context.Canceled
+		storage2 = promql.ErrStorage{Err: errors.New("503")}
+	)
+	tests := []struct {
+		name string
+		errs []error // in arrival order; each one's API index is its position
+		want error
+	}{
+		{"refused_beats_all", []error{canceled, storage, timeout, refused}, refused},
+		{"timeout_beats_storage", []error{storage, timeout}, timeout},
+		{"storage_beats_canceled", []error{canceled, storage}, storage},
+		{"tie_goes_to_lowest_index", []error{storage, storage2}, storage},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// The pick must not depend on arrival order.
+			for _, order := range [][]int{ascending(len(tc.errs)), descending(len(tc.errs))} {
+				var p errorPicker
+				for _, i := range order {
+					p.add(i, tc.errs[i])
+				}
+				if p.err != tc.want {
+					t.Errorf("arrival order %v: got %v, want %v", order, p.err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func ascending(n int) []int {
+	o := make([]int, n)
+	for i := range o {
+		o[i] = i
+	}
+	return o
+}
+
+func descending(n int) []int {
+	o := ascending(n)
+	slices.Reverse(o)
+	return o
 }
