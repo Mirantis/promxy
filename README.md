@@ -5,6 +5,28 @@
 # Promxy [![Test Actions Status](https://github.com/jacksontj/promxy/workflows/Go/badge.svg)](https://github.com/jacksontj/promxy/actions) [![GoDoc](https://godoc.org/github.com/jacksontj/promxy?status.svg)](https://godoc.org/github.com/jacksontj/promxy) [![Go Report Card](https://goreportcard.com/badge/github.com/jacksontj/promxy)](https://goreportcard.com/report/github.com/jacksontj/promxy) ![build](https://github.com/jacksontj/promxy/workflows/build/badge.svg) [![Docker Repository on Quay](https://quay.io/repository/jacksontj/promxy/status "Docker Repository on Quay")](https://quay.io/repository/jacksontj/promxy)
 
 pronounced "promski" or präm-sē
+--------------------------------
+
+## Mirantis downstream
+
+This repository is the Mirantis downstream of [jacksontj/promxy](https://github.com/jacksontj/promxy). It carries changes we need before, or instead of, upstream, and publishes the images we ship. All work happens on the default branch, `mirantis`: open PRs against it, and cut releases from it.
+
+**Contributing:** open PRs against `mirantis`. If a change is useful beyond Mirantis, also offer it upstream, so our diff from upstream stays small.
+
+**Bringing in upstream:** when upstream publishes a release, the `upstream-watch.yml` workflow opens an issue labelled `upstream-sync`. The issue lists the missing commits and any predicted conflicts. Merge upstream into `mirantis` through a PR, and merge that PR with **Create a merge commit**, never squash or rebase, so later merges from upstream stay clean. You can also merge upstream between releases when a security fix needs it.
+
+```bash
+git remote add upstream https://github.com/jacksontj/promxy.git   # once per clone
+git fetch upstream --tags
+git switch -c sync/upstream-<version> origin/mirantis
+git merge --no-ff <version>         # the upstream release tag, e.g. v0.0.98, or upstream/master
+```
+
+GitHub turns off scheduled workflows in public repositories after 60 days without activity. If the Actions tab shows `upstream-watch` as disabled, re-enable it with `gh workflow enable upstream-watch.yml --repo Mirantis/promxy`.
+
+**Releasing:** tag a commit on `mirantis` as `<upstream version>-mirantis.<n>`, for example `v0.0.97-mirantis.2`. The `mirantis-publish.yml` workflow builds the image for linux/amd64 and linux/arm64 and publishes it to `ghcr.io/mirantis/promxy:<tag>`.
+
+--------------------------------
 
 ## High-level overview
 Promxy is a prometheus proxy that makes many shards of prometheus
