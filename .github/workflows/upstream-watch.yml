@@ -1,0 +1,40 @@
+name: Upstream watch
+
+# Opens one issue per jacksontj/promxy release that the mirantis branch does
+# not contain yet. It only notifies: merging upstream is a manual PR, see the
+# README section "Mirantis downstream".
+#
+# Scheduled workflows run from the default branch (mirantis). GitHub disables
+# them in public repos after 60 days without repository activity; if this
+# workflow shows as disabled in the Actions tab, run:
+#   gh workflow enable upstream-watch.yml --repo Mirantis/promxy
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+
+jobs:
+  watch:
+    if: github.repository != 'jacksontj/promxy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mirantis
+          fetch-depth: 0  # merge-base and merge-tree need full history
+
+      - name: Check the latest upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPO: jacksontj/promxy
+          BASE_REF: origin/mirantis
+          LABEL: upstream-sync
+        run: bash .github/scripts/upstream-watch.sh
