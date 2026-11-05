@@ -30,6 +30,7 @@ jobs:
         with:
           ref: mirantis
           fetch-depth: 0  # merge-base and merge-tree need full history
+          persist-credentials: false
 
       - name: Check the latest upstream release
         env:
