@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
 RUN --mount=type=cache,target=/root/.cache/go-build,id=gobuild-${TARGETARCH} \
     cd /go/src/github.com/jacksontj/promxy/cmd/remote_write_exporter && CGO_ENABLED=0 go build -mod=vendor
 
-FROM   alpine:3.23.6
+FROM   alpine:3.23.7
 LABEL  org.opencontainers.image.authors="Thomas Jackson <jacksontj.89@gmail.com>"
 EXPOSE 8082
 
