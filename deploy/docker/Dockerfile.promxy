@@ -1,1 +1,2 @@
-FROM quay.io/jacksontj/promxy
+FROM ghcr.io/mirantis/promxy:v0.0.97-mirantis.2
+USER nobody
